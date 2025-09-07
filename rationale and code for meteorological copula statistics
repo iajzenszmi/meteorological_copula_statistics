@@ -1,0 +1,1272 @@
+Meteorology application of multivariate distribution in gfortran
+ChatGPT said:
+
+Great topic. A very common way to glue multiple weather variables together (e.g., temperature, relative humidity, and wind speed) is a multivariate normal (MVN) model (or a Gaussian copula with non-Gaussian marginals). Below is a self-contained gfortran (Fortran 2008 free-form) program that:
+
+    sets up a 3-var meteorology MVN: T (°C), RH (%), Wind (m/s)
+
+    validates the covariance via Cholesky (no external libs)
+
+    simulates N samples
+
+    estimates the joint exceedance probability of a “fire-weather” event: T ≥ 35 °C, RH ≤ 20%, Wind ≥ 10 m/s
+
+    prints sample means/correlations to verify the simulation
+
+    also includes an MVN log-likelihood routine you can use if you later want to fit (µ, Σ) by MLE
+
+You can swap in real means/SDs/correlations from your station or reanalysis, or wrap the reading of historical CSVs around the mvn_loglik and the correlation estimators.
+
+Compile with:
+
+gfortran -O2 -std=f2008 mvn_meteo.f90 -o mvn_meteo
+
+Run:
+
+./mvn_meteo
+
+mvn_meteo.f90
+
+! mvn_meteo.f90
+! Meteorology application of a multivariate distribution (MVN) in gfortran
+! - 3 variables: Temperature (C), Relative Humidity (%), Wind Speed (m/s)
+! - Cholesky (no external libs), Box-Muller normals, Monte Carlo exceedance probability
+! - MVN log-likelihood for optional fitting
+
+program mvn_meteo
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+  integer, parameter :: p = 3
+  integer :: i, n, seed_i
+  real(dp) :: mu(p), sd(p), Sigma(p,p), Corr(p,p), L(p,p)
+  real(dp) :: t_thr, rh_thr, w_thr
+  real(dp) :: prob_est
+  real(dp), allocatable :: X(:,:), z(:), y(:)
+  real(dp) :: smu(p), sCorr(p,p)
+
+  ! ---------- Model setup (replace with site-specific values) ----------
+  ! Means and standard deviations
+  mu  = [ 30.0_dp, 35.0_dp, 6.0_dp ]         ! [T (C), RH (%), Wind (m/s)]
+  sd  = [  6.0_dp, 20.0_dp, 3.0_dp ]
+
+  ! Correlation matrix (symmetric, pos.def)
+  Corr = reshape([ 1.0_dp, -0.70_dp,  0.30_dp,  &
+                  -0.70_dp,  1.0_dp, -0.20_dp, &
+                   0.30_dp, -0.20_dp, 1.0_dp ], [p,p])
+
+  call corr_to_cov(sd, Corr, Sigma)
+
+  ! Cholesky to verify positiveness, also used for simulation
+  if (.not. cholesky_spd(Sigma, L)) then
+     print *, "Covariance not SPD. Check your correlations/SDs."
+     stop 1
+  end if
+
+  ! ---------- Simulation parameters ----------
+  n = 100000   ! increase for more precise estimates
+  t_thr  = 35.0_dp
+  rh_thr = 20.0_dp
+  w_thr  = 10.0_dp
+
+  allocate(X(p,n), z(p), y(p))
+
+  ! Seed RNG (portable-ish)
+  call seed_with_time()
+
+  ! ---------- Monte Carlo simulation ----------
+  prob_est = 0.0_dp
+  do i = 1, n
+     call randn_vec(p, z)        ! z ~ N(0, I)
+     y = matvec(L, z) + mu       ! y ~ N(mu, Sigma)
+     X(:,i) = y
+     if (y(1) >= t_thr .and. y(2) <= rh_thr .and. y(3) >= w_thr) then
+        prob_est = prob_est + 1.0_dp
+     end if
+  end do
+  prob_est = prob_est / real(n,dp)
+
+  ! ---------- Diagnostics: sample mean & correlation from the simulation ----------
+  call sample_mean(p, n, X, smu)
+  call sample_corr(p, n, X, sCorr)
+
+  print '(a,f10.6)', "Estimated P(T>=35 & RH<=20 & Wind>=10) = ", prob_est
+  print *, "Sample means from simulation  [T, RH, Wind] ~ ", smu
+  print *, "Sample correlation matrix from simulation:"
+  call print_mat(sCorr)
+
+  ! ---------- Example use of MVN log-likelihood ----------
+  ! If you have observed yobs(:,i), you can sum mvn_loglik(mu,Sigma,yobs(:,i))
+  ! and optimize (mu, Sigma) to fit your site.
+  !
+  ! Here we just compute loglik for the first 5 simulated draws as a demo:
+  do i = 1, min(5,n)
+     print '(a,i0,a,f12.6)', "loglik(sample ", i, ") = ", mvn_loglik(mu, Sigma, X(:,i))
+  end do
+
+contains
+
+  subroutine corr_to_cov(sd, Corr, Sigma)
+    real(dp), intent(in)  :: sd(:), Corr(:,:)
+    real(dp), intent(out) :: Sigma(size(Corr,1), size(Corr,2))
+    integer :: i, j, m
+    m = size(sd)
+    do i = 1, m
+       do j = 1, m
+          Sigma(i,j) = Corr(i,j) * sd(i) * sd(j)
+       end do
+    end do
+  end subroutine corr_to_cov
+
+  logical function cholesky_spd(A, L)
+    ! Cholesky decomposition for symmetric positive-definite A: A = L*L^T
+    real(dp), intent(in)  :: A(:,:)
+    real(dp), intent(out) :: L(size(A,1), size(A,2))
+    integer :: i, j, k, n
+    real(dp) :: sumv
+    n = size(A,1)
+    L = 0.0_dp
+    cholesky_spd = .true.
+    do i = 1, n
+       do j = 1, i
+          sumv = A(i,j)
+          do k = 1, j-1
+             sumv = sumv - L(i,k)*L(j,k)
+          end do
+          if (i == j) then
+             if (sumv <= 0.0_dp) then
+                cholesky_spd = .false.
+                return
+             end if
+             L(i,j) = sqrt(sumv)
+          else
+             L(i,j) = sumv / L(j,j)
+          end if
+       end do
+    end do
+  end function cholesky_spd
+
+  function matvec(M, v) result(w)
+    real(dp), intent(in) :: M(:,:), v(:)
+    real(dp) :: w(size(M,1))
+    integer :: i, k, n, m
+    n = size(M,1); m = size(M,2)
+    w = 0.0_dp
+    do i = 1, n
+       do k = 1, m
+          w(i) = w(i) + M(i,k)*v(k)
+       end do
+    end do
+  end function matvec
+
+  subroutine randn_vec(m, z)
+    integer, intent(in) :: m
+    real(dp), intent(out) :: z(m)
+    integer :: i
+    real(dp) :: u1, u2, r, theta
+    ! Box-Muller in pairs
+    i = 1
+    do
+       call random_number(u1)
+       call random_number(u2)
+       if (u1 <= 1.0e-12_dp) cycle
+       r = sqrt(-2.0_dp*log(u1))
+       theta = 2.0_dp*acos(-1.0_dp)*u2
+       z(i) = r*cos(theta)
+       if (i+1 <= m) then
+          z(i+1) = r*sin(theta)
+          i = i + 2
+       else
+          exit
+       end if
+       if (i > m) exit
+    end do
+  end subroutine randn_vec
+
+  subroutine sample_mean(p, n, X, muhat)
+    integer, intent(in) :: p, n
+    real(dp), intent(in) :: X(p,n)
+    real(dp), intent(out) :: muhat(p)
+    integer :: i, j
+    muhat = 0.0_dp
+    do j = 1, n
+       do i = 1, p
+          muhat(i) = muhat(i) + X(i,j)
+       end do
+    end do
+    muhat = muhat / real(n,dp)
+  end subroutine sample_mean
+
+  subroutine sample_corr(p, n, X, Corr)
+    integer, intent(in) :: p, n
+    real(dp), intent(in) :: X(p,n)
+    real(dp), intent(out) :: Corr(p,p)
+    real(dp) :: mu(p), sdv(p), cov(p,p)
+    integer :: i, j, k
+
+    call sample_mean(p, n, X, mu)
+    sdv = 0.0_dp
+    cov = 0.0_dp
+
+    do k = 1, n
+       do i = 1, p
+          do j = 1, p
+             cov(i,j) = cov(i,j) + (X(i,k)-mu(i))*(X(j,k)-mu(j))
+          end do
+       end do
+    end do
+    cov = cov / real(n-1,dp)
+
+    do i = 1, p
+       sdv(i) = sqrt(max(cov(i,i), 1.0e-30_dp))
+    end do
+    do i = 1, p
+       do j = 1, p
+          Corr(i,j) = cov(i,j) / (sdv(i)*sdv(j))
+       end do
+    end do
+  end subroutine sample_corr
+
+  function mvn_loglik(mu, Sigma, y) result(ll)
+    ! log N_p(y | mu, Sigma)
+    real(dp), intent(in) :: mu(:), Sigma(:,:), y(:)
+    real(dp) :: ll
+    integer, parameter :: dp = kind(1.0d0)
+    integer :: p, i, j
+    real(dp) :: L(size(Sigma,1),size(Sigma,2)), logdet, z(size(mu))
+    real(dp) :: tmp
+    p = size(mu)
+
+    if (.not. cholesky_spd(Sigma, L)) then
+       ll = -huge(1.0_dp)
+       return
+    end if
+
+    ! Solve L * u = (y-mu) ; then z = u
+    z = y - mu
+    call forward_sub(L, z)      ! z := u solves L u = (y-mu)
+    ! Quadratic form = ||u||^2
+    tmp = 0.0_dp
+    do i = 1, p
+       tmp = tmp + z(i)*z(i)
+    end do
+
+    ! log|Sigma| = 2 * sum(log(diag(L)))
+    logdet = 0.0_dp
+    do i = 1, p
+       logdet = logdet + log(max(L(i,i),1.0e-300_dp))
+    end do
+    logdet = 2.0_dp*logdet
+
+    ll = -0.5_dp*( real(p,dp)*log(2.0_dp*acos(-1.0_dp)) + logdet + tmp )
+  end function mvn_loglik
+
+  subroutine forward_sub(L, b)
+    ! overwrite b with solution u of L u = b (L lower-triangular)
+    real(dp), intent(in)    :: L(:,:)
+    real(dp), intent(inout) :: b(:)
+    integer :: i, k, n
+    real(dp) :: sumv
+    n = size(b)
+    do i = 1, n
+       sumv = b(i)
+       do k = 1, i-1
+          sumv = sumv - L(i,k)*b(k)
+       end do
+       b(i) = sumv / L(i,i)
+    end do
+  end subroutine forward_sub
+
+  subroutine print_mat(A)
+    real(dp), intent(in) :: A(:,:)
+    integer :: i, j, n, m
+    n = size(A,1); m = size(A,2)
+    do i = 1, n
+       write(*,'(100(f10.5,1x))') (A(i,j), j=1,m)
+    end do
+  end subroutine print_mat
+
+  subroutine seed_with_time()
+    ! Simple seeding from system time
+    integer :: t(8), i, n
+    call date_and_time(values=t)
+    n = t(8) + 1000*t(7) + 100000*t(6)
+    call set_seed(n)
+  end subroutine seed_with_time
+
+  subroutine set_seed(s)
+    integer, intent(in) :: s
+    integer :: n, i
+    integer, allocatable :: seed(:)
+    call random_seed(size=n)
+    allocate(seed(n))
+    do i = 1, n
+       seed(i) = modulo(s + 37*i, 2147483647)
+       if (seed(i) == 0) seed(i) = 1
+    end do
+    call random_seed(put=seed)
+    deallocate(seed)
+  end subroutine set_seed
+
+end program mvn_meteo
+
+How to adapt this to real meteorology tasks
+
+    Fire weather: Use site-specific µ, SD, and correlations (T–RH strongly negative is typical; wind often weakly correlated). The Monte Carlo block estimates joint exceedance probabilities (useful for compound-extremes).
+
+    Rainfall: Amounts are zero-inflated and skewed. Use a Gaussian copula: transform each marginal to Normal via empirical CDF or a parametric CDF (e.g., gamma for rain>0), then apply a correlation on the transformed normals. The above code already gives you the MVN core; you’d add CDF↔quantile steps around it.
+
+    Spatial fields: Replace the 3×3 with k-dimensional vectors across nearby stations or variables; the same Cholesky approach works (watch condition numbers).
+
+    Fitting: Wrap mvn_loglik in an optimizer (Nelder–Mead or BFGS) to estimate µ and Σ from data, or compute sample µ and Σ directly and regularize (e.g., shrinkage) if sample size is small.
+
+If you want, I can extend this to (a) a Gaussian-copula rainfall–temperature–wind with empirical marginals, (b) CSV I/O to fit from your station records, or (c) a Fortran 77 version with column-restricted comments.
+You said:
+validate
+ChatGPT said:
+
+Here’s how to validate the program quickly and confidently.
+1) Compile checks
+
+Use strict flags first (debug build), then a fast build:
+
+# Debug / safety first
+gfortran -std=f2008 -g -O0 -Wall -Wextra -fcheck=all -fbacktrace mvn_meteo.f90 -o mvn_meteo_dbg
+./mvn_meteo_dbg
+
+# Release build
+gfortran -std=f2008 -O2 mvn_meteo.f90 -o mvn_meteo
+
+2) Independence “ground-truth” test (analytic answer = 0.125)
+
+This validates Box–Muller, Cholesky path, and the exceedance logic.
+
+Edit the model block to make three independent standard normals and thresholds at 0:
+
+! Replace the existing model setup with this for the test:
+mu  = [ 0.0_dp, 0.0_dp, 0.0_dp ]
+sd  = [ 1.0_dp, 1.0_dp, 1.0_dp ]
+Corr = 0.0_dp; Corr(1,1)=1.0_dp; Corr(2,2)=1.0_dp; Corr(3,3)=1.0_dp
+call corr_to_cov(sd, Corr, Sigma)
+! thresholds:
+t_thr  = 0.0_dp
+rh_thr = 0.0_dp
+w_thr  = 0.0_dp
+! also set n large for precision:
+n = 1000000
+
+Run it. Because the three variables are i.i.d. N(0,1),
+P(T ≥ 0) = 0.5, P(RH ≤ 0) = 0.5, P(Wind ≥ 0) = 0.5 and they’re independent ⇒ expected probability = 0.5³ = 0.125.
+
+What you should see
+
+    Estimated P(...) close to 0.125 (within ~±0.001 for n=1e6).
+
+    Sample means near 0 (|mean| < 0.01).
+
+    Sample correlation matrix close to identity (off-diagonals around 0 ± 0.003).
+
+3) Correlation recovery test
+
+Now check that correlations are actually imposed.
+
+Use:
+
+mu  = [ 0.0_dp, 0.0_dp, 0.0_dp ]
+sd  = [ 1.0_dp, 1.0_dp, 1.0_dp ]
+Corr = reshape([ 1.0_dp,  0.80_dp, -0.50_dp,  &
+                 0.80_dp,  1.0_dp,  0.30_dp,  &
+                -0.50_dp,  0.30_dp,  1.0_dp ], [3,3])
+n = 500000
+t_thr=0.0_dp; rh_thr=0.0_dp; w_thr=0.0_dp
+
+Expectations
+
+    Sample correlation matrix close to the target (within ~0.01 on diagonals, ~0.01–0.02 on off-diagonals at n=5e5).
+
+    Means still ≈ 0.
+
+4) Positive-definiteness guard test
+
+Intentionally break SPD to confirm the safety path:
+
+Corr = reshape([ 1.0_dp,  0.99_dp,  0.99_dp,  &
+                 0.99_dp,  1.0_dp,  0.99_dp,  &
+                 0.99_dp,  0.99_dp,  0.98_dp ], [3,3])
+
+This matrix can be near-singular or not SPD for some combos. The program should print:
+
+Covariance not SPD. Check your correlations/SDs.
+
+and exit with code 1. That’s correct behaviour.
+5) Reproducibility (fixed seed)
+
+For repeatable runs while testing, add this just before the simulation loop:
+
+call set_seed(1234567)
+
+(or comment out seed_with_time()).
+6) Quick numeric tolerances to check
+
+    With the original meteorology example (µ=[30,35,6], SD=[6,20,3], Corr as given) and n=1e5:
+
+        Sample means within about ±0.1–0.2 of µ.
+
+        Sample sCorr close to the target (off-diagonals within ±0.02–0.03 is typical at 1e5).
+
+        Joint exceedance probability will be small (rare compound event); expect a few × 10⁻³ range with the toy parameters.
+
+7) If anything looks off
+
+    Ensure Corr is symmetric and has ones on the diagonal.
+
+    If your chosen correlations make Σ ill-conditioned, slightly shrink toward identity:
+
+        Replace Sigma with Sigma := (1-λ)*Sigma + λ*diag(Sigma) for a small λ (e.g., 0.02).
+
+    Increase n by 10× to reduce Monte Carlo noise (SE ≈ √(p(1−p)/n)).
+
+8) Optional: tiny patch to print more digits
+
+If you want more precise correlation printout, change the format in print_mat:
+
+write(*,'(100(f12.7,1x))') (A(i,j), j=1,m)
+
+If you’d like, tell me which test you ran (and your output lines), and I’ll sanity-check the numbers against the expected ranges.
+You said:
+critique
+ChatGPT said:
+
+Here’s a tight, practical critique with fixes you can drop in.
+What’s solid
+
+    Clear structure and no external deps (nice for portability).
+
+    SPD‐check via Cholesky before sampling (good guardrail).
+
+    Diag: sample means + corr printed; simple MLE hook exposed.
+
+Main technical critiques & quick fixes
+
+1) Numeric robustness (Cholesky & covariance)
+
+    Issue: plain Cholesky can fail for near-singular Σ from noisy Corr.
+    Fix: add tiny diagonal jitter (a.k.a. nugget) before factorization and/or shrink Corr→I.
+
+Sigma = Sigma + 1.0e-10_dp*reshape([ (merge(1.0_dp,0.0_dp,i==j), i=1,p, j=1,p) ], [p,p])
+! or shrink toward diagonal: Sigma = (1.0_dp-lambda)*Sigma + lambda*diag(Sigma)  ! lambda≈0.02
+
+2) RNG quality & speed
+
+    Issue: Box–Muller is fine but slower and can suffer tail inaccuracy for extreme z.
+    Fix (no deps): keep Box–Muller, but cache the second variate so each pair of uniforms yields two normals (you currently do this, good). For speed/quality, consider Ziggurat later.
+
+3) Performance (loops & matvec)
+
+    Issue: matvec is tiny but called n times; inner loops aren’t cache-optimal.
+    Fix: exploit that L is lower-triangular and p is small; unroll explicitly or use MATMUL(L,z) (F2008 usually vectorizes well).
+
+y = matmul(L, z) + mu
+
+    Also, avoid storing all X(p,n) if you only need summary stats; stream them to accumulators to cut memory and cache misses.
+
+4) Column-major loop order
+
+    Issue: in sample_corr, the nested i/j/k loops walk memory inefficiently.
+    Fix: iterate k (sample) outermost and write to (i,j) is fine, but better: compute running means/cov with Welford to avoid a full pass + reduce cancellation.
+
+! One-pass Welford for covariance (sketch)
+! keep mean(p), M2(p,p); update per sample; cov=M2/(n-1)
+
+5) Log-likelihood linear solve
+
+    Issue: You factor Σ to L, then do custom forward solve and reuse z as u. Good—but finish the Mahalanobis distance using forward + back substitution cleanly to avoid confusion.
+
+! After forward_sub(L, u): solve L^T v = u and compute u·u = v·(L^T v)  (or simply sum(u**2) as you do)
+! Your approach computes ||u||^2, which is correct; add a comment making this explicit.
+
+    Add pure attribute to small helpers for better vectorization/inlining opportunities.
+
+6) Constants and kinds
+
+    Issue: dp = kind(1.0d0) is fine; more idiomatic is use, intrinsic :: iso_fortran_env, only: real64 then real(real64).
+    Fix:
+
+use, intrinsic :: iso_fortran_env, only: real64
+integer, parameter :: dp = real64
+
+7) π constant & underflow guards
+
+    Issue: repeated acos(-1.0_dp) is fine; define pi once. Guard logs/diagonals with larger floors to avoid log(0).
+
+real(dp), parameter :: pi = acos(-1.0_dp), LOG_FLOOR=1.0e-300_dp
+
+8) SPD validation messaging
+
+    Issue: when SPD fails, it’s useful to hint the user which corr pairs are extreme.
+    Fix: print min eigenvalue estimate via Gershgorin bound (cheap) or try smaller nugget and retry.
+
+9) Sampling thresholds
+
+    Issue: hard-coded thresholds tie the code to one use case.
+    Fix: CLI args or namelist.
+
+namelist /controls/ n, t_thr, rh_thr, w_thr
+read(*,nml=controls)  ! optional
+
+10) Meteorology realism
+
+    Issue: MVN tails can misestimate compound extremes (e.g., hot–dry–windy). Gaussian → weak tail dependence.
+    Fix: keep this MVN core but plan a Gaussian copula with non-Gaussian marginals (Gamma/lognormal for wind/rain, beta or logit-normal for RH capped to [0,100]). Add PIT transforms around the MVN engine. For heatwaves, consider EVT (GEV/GPD) for block maxima/threshold exceedances.
+
+11) Estimation path
+
+    Issue: “MLE later” is vague.
+    Fix: add a simple sample estimator + Ledoit–Wolf shrinkage for Σ as a drop-in for small samples; expose both.
+
+    Also, the loglik currently supports a single y. Provide a vectorized “sum over i=1..n”.
+
+12) Reproducibility & seeds
+
+    Issue: seed_with_time() is non-reproducible and can repeat for fast reruns.
+    Fix: prefer explicit set_seed(<int>) path; only fall back to time if absent. Optionally echo the seed used.
+
+13) API surface (I/O)
+
+    Issue: no CSV in/out; users will want to plug real station data.
+    Fix: add minimal CSV reader for columns T,RH,W (with header skip), or a namelist + binary .npy style if you want speed.
+
+14) Testing
+
+    Add the three tests you validated as unit tests:
+
+        Independence test → P=0.125
+
+        Corr recovery (e.g., ρ=0.8, −0.5, 0.3)
+
+        SPD break → proper exit
+        Consider a tiny ctest-like driver or write an exit code protocol.
+
+Minimal code patches (drop-ins)
+
+Use MATMUL & constants
+
+! at top
+use, intrinsic :: iso_fortran_env, only: real64
+integer, parameter :: dp = real64
+real(dp), parameter :: PI = acos(-1.0_dp), LOG_FLOOR = 1.0e-300_dp
+
+! replace 2.0_dp*acos(-1.0_dp) with 2.0_dp*PI
+y = matmul(L, z) + mu
+
+Nugget before Cholesky
+
+Sigma = Sigma + 1.0e-10_dp*merge(1.0_dp,0.0_dp,reshape([(i==j, i=1,p, j=1,p)],[p,p]))
+if (.not. cholesky_spd(Sigma, L)) then
+   print *, "Covariance not SPD even after jitter; shrink correlations or SDs."
+   stop 1
+end if
+
+Streaming stats (Welford)
+
+! Replace sample_mean/sample_corr with a one-pass Welford accumulator
+type Accum
+  real(dp) :: mean(p) = 0.0_dp
+  real(dp) :: M2(p,p) = 0.0_dp
+  integer  :: count = 0
+end type
+type(Accum) :: A
+real(dp) :: delta(p), mean_old(p)
+
+do i=1,n
+  call randn_vec(p,z)
+  y = matmul(L,z) + mu
+  A%count = A%count + 1
+  delta = y - A%mean
+  mean_old = A%mean
+  A%mean = mean_old + delta / real(A%count,dp)
+  A%M2 = A%M2 + reshape([( (y(k)-A%mean(k))*(y(j)-A%mean(j)) - &
+                            (mean_old(k)-A%mean(k))*(mean_old(j)-A%mean(j)), k=1,p, j=1,p )],[p,p])
+end do
+! cov = A%M2 / (A%count - 1); Corr from cov as you already do
+
+(Above shows idea; you can implement the classic matrix Welford in a few lines, or keep your two-pass but reorder loops for cache.)
+Optional next steps (strongly recommended)
+
+    Add a Gaussian-copula wrapper so you can feed real marginals (Gamma rain>0, zero-inflation, log-wind, beta/logit-RH).
+
+    CLI/namelist for µ, SD, Corr, thresholds, n, seed.
+
+    Unit tests + fixed seeds.
+
+    If you’re okay with a dependency, switch to LAPACK for dpotrf/dpotrs and BLAS for dgemv—you’ll get speed + numerical polish.
+
+If you want, I can:
+(a) patch your file with MATMUL + nugget + namelist + streaming stats (no deps), or
+(b) give you a Gaussian-copula version ready to drop in (still no external libs).
+You said:
+matmul and gaussian copola
+ChatGPT said:
+
+Got it — here’s a MATMUL-based Gaussian copula version you can drop in. It:
+
+    uses MATMUL for the linear algebra path,
+
+    builds a Gaussian copula in Z-space (correlated normals via Cholesky),
+
+    maps uniforms to realistic marginals:
+
+        Temperature: Normal(μ, σ)
+
+        Relative Humidity: Logit-Normal on [0,100] (%)
+
+        Wind speed: Weibull(k, λ)
+
+    estimates the compound-event probability (hot–dry–windy),
+
+    prints diagnostics (means and the Z-space correlation that should match your target Corr).
+
+Compile:
+
+gfortran -O2 -std=f2008 copula_meteo.f90 -o copula_meteo
+./copula_meteo
+
+copula_meteo.f90
+
+! Gaussian Copula meteorology demo with MATMUL
+! Variables:
+!  - T (C):      Normal( mu_T, sd_T )
+!  - RH (%):     Logit-Normal on [0,100] via logistic(mu_L + sd_L * Phi^{-1}(u))
+!  - Wind (m/s): Weibull(k, lambda)
+!
+! Dependence:
+!  - Specify Corr_Z (3x3) for the Gaussian copula in Z-space (correlated standard normals)
+!  - Sample z_raw ~ N(0,I), set z = L * z_raw  (L from Cholesky(Corr_Z))
+!  - u_i = Phi(z_i)
+!  - x_i = F_i^{-1}(u_i) via chosen marginal quantiles
+!
+! No external libs. Fortran 2008 free form. gfortran-compatible.
+
+program copula_meteo
+  use, intrinsic :: iso_fortran_env, only: real64
+  implicit none
+  integer, parameter :: dp = real64
+  real(dp), parameter :: PI = acos(-1.0_dp), LOG_FLOOR = 1.0e-300_dp
+
+  integer, parameter :: p = 3
+  integer :: i, n
+  real(dp) :: CorrZ(p,p), L(p,p)
+  real(dp) :: zraw(p), z(p), u(p)
+  real(dp) :: T, RH, W
+  real(dp) :: hot_thr, dry_thr, wind_thr, prob_est
+
+  ! Streaming stats for diagnostics
+  real(dp) :: meanZ(p) = 0.0_dp
+  real(dp) :: M2Z(p,p) = 0.0_dp
+  integer  :: count = 0
+  real(dp) :: deltaZ(p), oldMeanZ(p)
+  real(dp) :: covZ(p,p), corrZhat(p,p)
+  integer :: r, c
+
+  ! ---- Marginal parameters (edit to your site) ----
+  ! Temperature ~ Normal
+  real(dp), parameter :: mu_T = 30.0_dp, sd_T = 6.0_dp
+
+  ! RH (%) ~ Logit-Normal on [0,100]
+  ! Choose logit-scale mean/sd so median ~ 35% and broad variability.
+  real(dp), parameter :: RH_med = 0.35_dp
+  real(dp), parameter :: mu_L = log(RH_med/(1.0_dp-RH_med))  ! logit(median)
+  real(dp), parameter :: sd_L = 0.8_dp                       ! adjust dispersion
+
+  ! Wind (m/s) ~ Weibull(k, lambda)
+  real(dp), parameter :: k_w = 2.0_dp, lambda_w = 8.0_dp
+
+  ! ---- Copula correlation (Z-space) ----
+  CorrZ = reshape([ 1.0_dp, -0.65_dp,  0.30_dp,  &
+                   -0.65_dp, 1.0_dp,  -0.20_dp, &
+                    0.30_dp,-0.20_dp,  1.0_dp ], [p,p])
+
+  ! ---- Simulation & thresholds ----
+  n = 100000
+  hot_thr  = 35.0_dp
+  dry_thr  = 20.0_dp
+  wind_thr = 10.0_dp
+
+  ! Factorization with tiny jitter for robustness
+  if (.not. cholesky_spd(CorrZ + 1.0e-12_dp*eye(p), L)) then
+     print *, "CorrZ not SPD. Shrink correlations slightly and retry."
+     stop 1
+  end if
+
+  call seed_with_time()
+  prob_est = 0.0_dp
+
+  do i = 1, n
+     call randn_vec(p, zraw)       ! zraw ~ N(0, I)
+     z = matmul(L, zraw)           ! correlate via MATMUL
+     u = [phi(z(1)), phi(z(2)), phi(z(3))]   ! uniforms in (0,1)
+
+     ! Marginal inverse CDFs (quantiles)
+     T  = q_normal(mu_T, sd_T, u(1))
+     RH = 100.0_dp * logistic( mu_L + sd_L * invnorm(u(2)) )
+     W  = q_weibull(k_w, lambda_w, u(3))
+
+     if (T >= hot_thr .and. RH <= dry_thr .and. W >= wind_thr) prob_est = prob_est + 1.0_dp
+
+     ! streaming Z-correlation diagnostic (should match CorrZ)
+     count = count + 1
+     deltaZ = z - meanZ
+     oldMeanZ = meanZ
+     meanZ = oldMeanZ + deltaZ / real(count,dp)
+     ! rank-1 update for covariance accumulator
+     do r=1,p
+        do c=1,p
+           M2Z(r,c) = M2Z(r,c) + (z(r)-meanZ(r))*(z(c)-meanZ(c)) - (oldMeanZ(r)-meanZ(r))*(oldMeanZ(c)-meanZ(c))
+        end do
+     end do
+  end do
+
+  prob_est = prob_est / real(n,dp)
+
+  ! sample corr in Z-space
+  covZ = M2Z / real(max(1,count-1),dp)
+  do r=1,p
+     do c=1,p
+        corrZhat(r,c) = covZ(r,c) / sqrt(max(covZ(r,r),1e-30_dp)*max(covZ(c,c),1e-30_dp))
+     end do
+  end do
+
+  print '(a,f12.6)', "Estimated P( T≥35 & RH≤20 & W≥10 ) = ", prob_est
+  print *, "Sample Z-space correlation (should match target CorrZ):"
+  call print_mat(corrZhat)
+
+contains
+  pure function eye(n) result(I)
+    integer, intent(in) :: n
+    real(dp) :: I(n,n)
+    integer :: i,j
+    I = 0.0_dp
+    do i=1,n; I(i,i)=1.0_dp; end do
+  end function eye
+
+  logical function cholesky_spd(A, L)
+    real(dp), intent(in)  :: A(:,:)
+    real(dp), intent(out) :: L(size(A,1), size(A,2))
+    integer :: i, j, k, n
+    real(dp) :: sumv
+    n = size(A,1); L=0.0_dp; cholesky_spd=.true.
+    do i = 1, n
+       do j = 1, i
+          sumv = A(i,j)
+          do k = 1, j-1
+             sumv = sumv - L(i,k)*L(j,k)
+          end do
+          if (i == j) then
+             if (sumv <= 0.0_dp) then
+                cholesky_spd = .false.; return
+             end if
+             L(i,j) = sqrt(sumv)
+          else
+             L(i,j) = sumv / L(j,j)
+          end if
+       end do
+    end do
+  end function cholesky_spd
+
+  subroutine randn_vec(m, z)
+    integer, intent(in) :: m
+    real(dp), intent(out) :: z(m)
+    integer :: i
+    real(dp) :: u1, u2, r, theta
+    i = 1
+    do
+       call random_number(u1); call random_number(u2)
+       if (u1 <= 1.0e-12_dp) cycle
+       r = sqrt(-2.0_dp*log(u1))
+       theta = 2.0_dp*PI*u2
+       z(i) = r*cos(theta)
+       if (i+1 <= m) then
+          z(i+1) = r*sin(theta)
+          i = i + 2
+       else
+          exit
+       end if
+       if (i > m) exit
+    end do
+  end subroutine randn_vec
+
+  subroutine seed_with_time()
+    integer :: t(8), n, i
+    integer, allocatable :: seed(:)
+    call date_and_time(values=t)
+    call random_seed(size=n)
+    allocate(seed(n))
+    do i=1,n
+       seed(i) = max(1, modulo( t(8) + 1000*t(7) + 100000*t(6) + 37*i, 2147483647 ))
+    end do
+    call random_seed(put=seed)
+    deallocate(seed)
+  end subroutine seed_with_time
+
+  ! ---- Gaussian CDF and quantile ----
+  pure real(dp) function phi(x) result(p)
+    real(dp), intent(in) :: x
+    p = 0.5_dp * erfc( -x / sqrt(2.0_dp) )
+  end function phi
+
+  pure real(dp) function invnorm(u) result(z)
+    ! Acklam's rational approximation to Phi^{-1}(u), u in (0,1)
+    real(dp), intent(in) :: u
+    real(dp) :: x, q, t
+    ! Coefficients (Peter J. Acklam, 2003)
+    real(dp), parameter :: a1=-3.969683028665376d+01, a2= 2.209460984245205d+02, a3=-2.759285104469687d+02, &
+                           a4= 1.383577518672690d+02, a5=-3.066479806614716d+01, a6= 2.506628277459239d+00
+    real(dp), parameter :: b1=-5.447609879822406d+01, b2= 1.615858368580409d+02, b3=-1.556989798598866d+02, &
+                           b4= 6.680131188771972d+01, b5=-1.328068155288572d+01
+    real(dp), parameter :: c1=-7.784894002430293d-03, c2=-3.223964580411365d-01, c3=-2.400758277161838d+00, &
+                           c4=-2.549732539343734d+00, c5= 4.374664141464968d+00, c6= 2.938163982698783d+00
+    real(dp), parameter :: d1= 7.784695709041462d-03, d2= 3.224671290700398d-01, d3= 2.445134137142996d+00, &
+                           d4= 3.754408661907416d+00
+    real(dp), parameter :: plow=0.02425_dp, phigh=1.0_dp-plow
+
+    x = max(min(u,1.0_dp-1.0e-16_dp),1.0e-16_dp)
+    if (x < plow) then
+       q = sqrt(-2.0_dp*log(x))
+       z = (((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6) / ((((d1*q+d2)*q+d3)*q+d4)*q+1.0_dp)
+       z = -z
+    else if (x <= phigh) then
+       q = x - 0.5_dp
+       t = q*q
+       z = (((((a1*t+a2)*t+a3)*t+a4)*t+a5)*t+a6)*q / (((((b1*t+b2)*t+b3)*t+b4)*t+b5)*t+1.0_dp)
+    else
+       q = sqrt(-2.0_dp*log(1.0_dp-x))
+       z = (((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6) / ((((d1*q+d2)*q+d3)*q+d4)*q+1.0_dp)
+    end if
+  end function invnorm
+
+  ! ---- Marginal quantiles ----
+  pure real(dp) function q_normal(mu, sd, u) result(x)
+    real(dp), intent(in) :: mu, sd, u
+    x = mu + sd * invnorm(u)
+  end function q_normal
+
+  pure real(dp) function logistic(t) result(y)
+    real(dp), intent(in) :: t
+    y = 1.0_dp / (1.0_dp + exp(-t))
+  end function logistic
+
+  pure real(dp) function q_weibull(k, lambda, u) result(x)
+    real(dp), intent(in) :: k, lambda, u
+    real(dp) :: uu
+    uu = max(min(u, 1.0_dp-1.0e-16_dp), 1.0e-16_dp)
+    x = lambda * (-log(1.0_dp-uu))**(1.0_dp/k)
+  end function q_weibull
+
+  subroutine print_mat(A)
+    real(dp), intent(in) :: A(:,:)
+    integer :: i, j, n, m
+    n = size(A,1); m = size(A,2)
+    do i = 1, n
+       write(*,'(100(f12.6,1x))') (A(i,j), j=1,m)
+    end do
+  end subroutine print_mat
+
+end program copula_meteo
+
+Notes & how to adapt
+
+    Edit CorrZ to the dependence you want. The printed Z-space correlation should track it closely (sampling noise ~ O(1/√n)).
+
+    RH’s logit-normal is an easy, practical bounded model. Tune sd_L to match your site’s spread; mu_L was set via the desired median.
+
+    If you prefer lognormal wind, replace q_weibull with exp(mu_w + sd_w * invnorm(u)).
+
+    For rainfall with zeros, extend to a 4th variable: set u4, then if u4 < p0 ⇒ rain=0 else rain = positive part via a quantile (Weibull/lognormal). (Gamma needs an inverse-gamma CDF; doable with Newton but longer—happy to add if you want it.)
+
+    Threshold logic: change hot_thr, dry_thr, wind_thr to your definitions (e.g., FFDI components).
+
+If you want: I can bolt on namelist I/O (seed, n, CorrZ, marginal params, thresholds) and a Spearman/Kendall diagnostic (more copula-appropriate) — still zero dependencies.
+You said:
+i want
+ChatGPT said:
+
+Great — so you’d like me to extend the MATMUL version with a Gaussian copula wrapper and realistic meteorological marginals. That’s exactly what the copula_meteo.f90 program I gave you does:
+
+    Dependence: specified in Z-space as a correlation matrix CorrZ.
+
+    MATMUL: used for z = matmul(L, zraw) after Cholesky.
+
+    Copula transform:
+
+        Step 1: draw zraw ~ N(0,I)
+
+        Step 2: correlate with L (Cholesky factor)
+
+        Step 3: convert each component to uniform u = Phi(z)
+
+        Step 4: pass through each marginal inverse CDF:
+
+            Temperature → Normal quantile
+
+            RH → Logit-Normal scaled to [0,100]
+
+            Wind → Weibull quantile
+
+It then estimates the probability of compound events like T ≥ 35, RH ≤ 20, W ≥ 10.
+
+✅ If you want more:
+
+    Namelist input (instead of editing the source) for µ, σ, thresholds, CorrZ, etc.
+
+    Alternative marginals (e.g., Gamma for rainfall, lognormal for wind, bounded beta for RH).
+
+    Diagnostics in copula space (Spearman/Kendall correlation) — better for non-Gaussian marginals.
+
+    CSV I/O so you can fit marginal distributions from your actual station/reanalysis data.
+
+Would you like me to add (1) a namelist interface so you can configure CorrZ, sample size, and thresholds from a small text file — or should I go straight to (2) adding a rainfall variable with zero inflation (Gaussian copula + Gamma positive part)?
+You said:
+(base) ian@debian:~$ gfortran Gaussian_Copula_meteorology.f90 -ffree-form
+Gaussian_Copula_meteorology.f90:112:16:
+
+  112 |     integer :: i,j
+      |                1
+Error: Symbol ‘i’ at (1) already has basic type of REAL
+Gaussian_Copula_meteorology.f90:114:9:
+
+  114 |     do i=1,n; I(i,i)=1.0_dp; end do
+      |         1
+Error: Loop variable at (1) cannot be an array
+Gaussian_Copula_meteorology.f90:114:32:
+
+  114 |     do i=1,n; I(i,i)=1.0_dp; end do
+      |                                1
+Error: Expecting END FUNCTION statement at (1)
+Gaussian_Copula_meteorology.f90:114:16:
+
+  114 |     do i=1,n; I(i,i)=1.0_dp; end do
+      |                1
+Warning: Legacy Extension: REAL array index at (1)
+Gaussian_Copula_meteorology.f90:114:16:
+
+  114 |     do i=1,n; I(i,i)=1.0_dp; end do
+      |                1
+Error: Array index at (1) is an array of rank 2
+ChatGPT said:
+
+Ah—that one’s on me. Fortran is case-insensitive, so the function result name I in eye(...) result(I) clashes with the loop index i. The compiler then thinks your loop variable is an array, hence the “loop variable cannot be an array” error.
+
+Fix = rename the result (and indices) so nothing shares the name i/I.
+Drop-in patch (replace your eye function)
+
+pure function eye(n) result(Id)
+  ! Identity matrix of size n
+  use, intrinsic :: iso_fortran_env, only: real64
+  implicit none
+  integer, intent(in) :: n
+  real(real64) :: Id(n,n)
+  integer :: ii
+
+  Id = 0.0_real64
+  do ii = 1, n
+     Id(ii, ii) = 1.0_real64
+  end do
+end function eye
+
+That’s it. No other changes needed—your call site like:
+
+if (.not. cholesky_spd(CorrZ + 1.0e-12_dp*eye(p), L)) then
+
+stays the same.
+Recompile
+
+gfortran -std=f2008 -O2 -Wall -Wextra Gaussian_Copula_meteorology.f90 -o copula_meteo
+
+If anything else trips, paste the next error and I’ll patch it fast.
+You said:
+complete and fully correct code
+ChatGPT said:
+
+Here’s a complete, corrected, single-file Fortran 2008 program that builds a Gaussian copula with realistic meteo marginals, uses MATMUL, includes a robust SPD check (with tiny jitter), and prints the compound-event probability plus a diagnostic Z-space correlation (which should match your target).
+
+Compile & run:
+
+gfortran -std=f2008 -O2 -Wall -Wextra Gaussian_Copula_Meteorology.f90 -o copula_meteo
+./copula_meteo
+
+Gaussian_Copula_Meteorology.f90
+
+! Gaussian_Copula_Meteorology.f90
+! Self-contained Gaussian Copula demo for meteorology
+! Variables:
+!  - Temperature T (°C): Normal(mu_T, sd_T)
+!  - Relative Humidity RH (%): Logit-Normal mapped to [0,100]
+!  - Wind speed W (m/s): Weibull(k, lambda)
+!
+! Dependence via Gaussian Copula in Z-space:
+!   1) Draw z_raw ~ N(0, I)
+!   2) z = L * z_raw   where L = chol(CorrZ)
+!   3) u = Phi(z)      (componentwise)
+!   4) x_i = F_i^{-1}(u_i) using chosen marginals
+!
+! Prints:
+!  - Estimated P(T >= hot_thr  &  RH <= dry_thr  &  W >= wind_thr)
+!  - Sample Z-space correlation (should approximate CorrZ)
+
+program copula_meteo
+  use, intrinsic :: iso_fortran_env, only: real64
+  implicit none
+
+  ! ----- kinds & constants -----
+  integer, parameter :: dp = real64
+  real(dp), parameter :: PI = acos(-1.0_dp)
+  real(dp), parameter :: EPS_JITTER = 1.0e-12_dp
+
+  ! ----- dimensions -----
+  integer, parameter :: p = 3    ! [T, RH, W]
+
+  ! ----- variables -----
+  integer :: i, n, r, c, count
+  real(dp) :: CorrZ(p,p), L(p,p)
+  real(dp) :: zraw(p), z(p), u(p)
+  real(dp) :: T_val, RH_val, W_val
+  real(dp) :: hot_thr, dry_thr, wind_thr, prob_est
+
+  ! streaming moments for Z (diagnostics)
+  real(dp) :: meanZ(p), oldMeanZ(p)
+  real(dp) :: M2Z(p,p), covZ(p,p), corrZhat(p,p)
+
+  ! ----- marginal params (edit for your site) -----
+  ! Temperature ~ Normal
+  real(dp), parameter :: mu_T = 30.0_dp, sd_T = 6.0_dp
+
+  ! RH (%) ~ Logit-Normal over [0,100]
+  ! Choose logit-scale mean/sd so median ~ 35% and reasonable spread
+  real(dp), parameter :: RH_med = 0.35_dp
+  real(dp), parameter :: mu_L = log(RH_med/(1.0_dp-RH_med))
+  real(dp), parameter :: sd_L = 0.8_dp
+
+  ! Wind (m/s) ~ Weibull(k, lambda)
+  real(dp), parameter :: k_w = 2.0_dp, lambda_w = 8.0_dp
+
+  ! ----- copula correlation in Z-space -----
+  ! Adjust to your dependence. Must be symmetric, SPD.
+  CorrZ = reshape([ 1.0_dp, -0.65_dp,  0.30_dp,  &
+                   -0.65_dp,  1.0_dp, -0.20_dp,  &
+                    0.30_dp, -0.20_dp,  1.0_dp ], [p,p])
+
+  ! ----- simulation settings / thresholds -----
+  n        = 100000
+  hot_thr  = 35.0_dp
+  dry_thr  = 20.0_dp
+  wind_thr = 10.0_dp
+
+  ! ----- factorize CorrZ with tiny jitter for robustness -----
+  if (.not. cholesky_spd(CorrZ + EPS_JITTER*eye(p), L)) then
+     print *, "ERROR: CorrZ is not SPD even after jitter. Shrink correlations and retry."
+     stop 1
+  end if
+
+  call seed_with_time()
+
+  prob_est = 0.0_dp
+  meanZ    = 0.0_dp
+  M2Z      = 0.0_dp
+  count    = 0
+
+  do i = 1, n
+     call randn_vec(p, zraw)    ! z_raw ~ N(0, I)
+     z = matmul(L, zraw)        ! correlate
+
+     ! uniforms in (0,1) from standard normal CDF
+     u(1) = phi(z(1))
+     u(2) = phi(z(2))
+     u(3) = phi(z(3))
+
+     ! marginals
+     T_val  = q_normal(mu_T, sd_T, u(1))
+     RH_val = 100.0_dp * logistic( mu_L + sd_L * invnorm(u(2)) )
+     W_val  = q_weibull(k_w, lambda_w, u(3))
+
+     ! compound event
+     if (T_val >= hot_thr .and. RH_val <= dry_thr .and. W_val >= wind_thr) then
+        prob_est = prob_est + 1.0_dp
+     end if
+
+     ! streaming moments for Z (matrix Welford)
+     count    = count + 1
+     oldMeanZ = meanZ
+     meanZ    = oldMeanZ + (z - oldMeanZ) / real(count, dp)
+     do r = 1, p
+        do c = 1, p
+           M2Z(r,c) = M2Z(r,c) + (z(r) - meanZ(r)) * (z(c) - oldMeanZ(c))
+        end do
+     end do
+  end do
+
+  prob_est = prob_est / real(n, dp)
+
+  ! sample corr in Z-space (should match CorrZ up to Monte Carlo error)
+  if (count > 1) then
+     covZ = M2Z / real(count - 1, dp)
+  else
+     covZ = 0.0_dp
+  end if
+
+  do r = 1, p
+     do c = 1, p
+        corrZhat(r,c) = covZ(r,c) / sqrt( max(covZ(r,r),1e-30_dp) * max(covZ(c,c),1e-30_dp) )
+     end do
+  end do
+
+  write(*,'(a,f12.6)') "Estimated P( T>=hot & RH<=dry & W>=wind ) = ", prob_est
+  print *, "Sample Z-space correlation (should approximate CorrZ):"
+  call print_mat(corrZhat)
+
+contains
+  !===================== Helpers =====================
+
+  pure function eye(n) result(Id)
+    ! Identity matrix (n x n)
+    integer, intent(in) :: n
+    real(dp) :: Id(n,n)
+    integer :: ii
+    Id = 0.0_dp
+    do ii = 1, n
+       Id(ii, ii) = 1.0_dp
+    end do
+  end function eye
+
+  logical function cholesky_spd(A, L)
+    ! Cholesky factorization A = L*L^T for symmetric positive-definite A
+    real(dp), intent(in)  :: A(:,:)
+    real(dp), intent(out) :: L(size(A,1), size(A,2))
+    integer :: i, j, k, n
+    real(dp) :: sumv
+    n = size(A,1)
+    L = 0.0_dp
+    cholesky_spd = .true.
+    do i = 1, n
+       do j = 1, i
+          sumv = A(i,j)
+          do k = 1, j-1
+             sumv = sumv - L(i,k)*L(j,k)
+          end do
+          if (i == j) then
+             if (sumv <= 0.0_dp) then
+                cholesky_spd = .false.
+                return
+             end if
+             L(i,j) = sqrt(sumv)
+          else
+             L(i,j) = sumv / L(j,j)
+          end if
+       end do
+    end do
+  end function cholesky_spd
+
+  subroutine randn_vec(m, z)
+    ! Box–Muller vector of length m (uses pairs)
+    integer, intent(in) :: m
+    real(dp), intent(out) :: z(m)
+    integer :: idx
+    real(dp) :: u1, u2, radius, theta
+    idx = 1
+    do
+       call random_number(u1)
+       call random_number(u2)
+       if (u1 <= 1.0e-16_dp) cycle
+       radius = sqrt(-2.0_dp*log(u1))
+       theta  = 2.0_dp*PI*u2
+       z(idx) = radius * cos(theta)
+       if (idx + 1 <= m) then
+          z(idx+1) = radius * sin(theta)
+          idx = idx + 2
+       else
+          exit
+       end if
+       if (idx > m) exit
+    end do
+  end subroutine randn_vec
+
+  subroutine seed_with_time()
+    ! Reasonable portable seeding from system time
+    integer :: t(8), nseed, i
+    integer, allocatable :: seed(:)
+    call date_and_time(values=t)
+    call random_seed(size=nseed)
+    allocate(seed(nseed))
+    do i = 1, nseed
+       seed(i) = max(1, modulo( t(8) + 1000*t(7) + 100000*t(6) + 37*i, 2147483647 ))
+    end do
+    call random_seed(put=seed)
+    deallocate(seed)
+  end subroutine seed_with_time
+
+  ! ---- Gaussian CDF and quantile ----
+  pure real(dp) function phi(x) result(pu)
+    real(dp), intent(in) :: x
+    pu = 0.5_dp * erfc( -x / sqrt(2.0_dp) )
+  end function phi
+
+  pure real(dp) function invnorm(u) result(z)
+    ! Acklam’s rational approximation for Phi^{-1}(u), u in (0,1)
+    real(dp), intent(in) :: u
+    real(dp) :: x, q, t
+    real(dp), parameter :: a1=-3.969683028665376d+01, a2= 2.209460984245205d+02, a3=-2.759285104469687d+02, &
+                           a4= 1.383577518672690d+02, a5=-3.066479806614716d+01, a6= 2.506628277459239d+00
+    real(dp), parameter :: b1=-5.447609879822406d+01, b2= 1.615858368580409d+02, b3=-1.556989798598866d+02, &
+                           b4= 6.680131188771972d+01, b5=-1.328068155288572d+01
+    real(dp), parameter :: c1=-7.784894002430293d-03, c2=-3.223964580411365d-01, c3=-2.400758277161838d+00, &
+                           c4=-2.549732539343734d+00, c5= 4.374664141464968d+00, c6= 2.938163982698783d+00
+    real(dp), parameter :: d1= 7.784695709041462d-03, d2= 3.224671290700398d-01, d3= 2.445134137142996d+00, &
+                           d4= 3.754408661907416d+00
+    real(dp), parameter :: plow=0.02425_dp, phigh=1.0_dp-plow
+
+    x = max( min(u, 1.0_dp-1.0e-16_dp), 1.0e-16_dp )
+    if (x < plow) then
+       q = sqrt(-2.0_dp*log(x))
+       z = (((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6) / ((((d1*q+d2)*q+d3)*q+d4)*q+1.0_dp)
+       z = -z
+    else if (x <= phigh) then
+      q = x - 0.5_dp
+      t = q*q
+      z = (((((a1*t+a2)*t+a3)*t+a4)*t+a5)*t+a6)*q / (((((b1*t+b2)*t+b3)*t+b4)*t+b5)*t+1.0_dp)
+    else
+      q = sqrt(-2.0_dp*log(1.0_dp-x))
+      z = (((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6) / ((((d1*q+d2)*q+d3)*q+d4)*q+1.0_dp)
+    end if
+  end function invnorm
+
+  ! ---- marginal quantiles ----
+  pure real(dp) function q_normal(mu, sd, u) result(x)
+    real(dp), intent(in) :: mu, sd, u
+    x = mu + sd * invnorm(u)
+  end function q_normal
+
+  pure real(dp) function logistic(t) result(y)
+    real(dp), intent(in) :: t
+    y = 1.0_dp / (1.0_dp + exp(-t))
+  end function logistic
+
+  pure real(dp) function q_weibull(k, lambda, u) result(x)
+    real(dp), intent(in) :: k, lambda, u
+    real(dp) :: uu
+    uu = max( min(u, 1.0_dp-1.0e-16_dp), 1.0e-16_dp )
+    x  = lambda * (-log(1.0_dp - uu))**(1.0_dp / k)
+  end function q_weibull
+
+  subroutine print_mat(A)
+    real(dp), intent(in) :: A(:,:)
+    integer :: irow, jcol, nrow, ncol
+    nrow = size(A,1); ncol = size(A,2)
+    do irow = 1, nrow
+       write(*,'(100(f12.6,1x))') (A(irow,jcol), jcol=1,ncol)
+    end do
+  end subroutine print_mat
+
+end program copula_meteo
+
+Want me to add a tiny namelist so you can set n, thresholds, and CorrZ from a text file without touching the source, or extend this to include a zero-inflated Gamma rainfall variable?
+
+
+ChatGPT can make mistakes. Check important info.
